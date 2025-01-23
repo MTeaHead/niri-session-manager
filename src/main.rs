@@ -13,6 +13,9 @@ use tokio::{
 use serde::{Serialize, Deserialize};
 use std::time::{ UNIX_EPOCH};
 use clap::Parser;
+use std::io::Write;
+use std::collections::HashMap;
+use toml;
 
 /// Fetch the windows list
 async fn get_niri_windows() -> Result<Vec<Window>> {
@@ -66,7 +69,7 @@ async fn save_session(file_path: &PathBuf) -> Result<()> {
         .context("Failed to serialize window data")?;
 
     fs::write(file_path, json_data).context("Failed to write session file")?;
-    println!("Session saved to {}", file_path.display());
+    log(&format!("Session saved to {}", file_path.display()));
     Ok(())
 }
 
@@ -88,18 +91,71 @@ async fn restore_session(file_path: &PathBuf, config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Internal restore function
+/// App launch configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AppConfig {
+    #[serde(default)]
+    app_mappings: HashMap<String, Vec<String>>,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            app_mappings: HashMap::new(),
+        }
+    }
+}
+
+/// Load app configuration from TOML file
+fn load_app_config() -> Result<AppConfig> {
+    let mut config_path = dirs::config_dir()
+        .context("Failed to locate config directory")?;
+    config_path.push("niri-session-manager");
+    config_path.push("config.toml");
+
+    if !config_path.exists() {
+        // Create default config if it doesn't exist
+        fs::create_dir_all(config_path.parent().unwrap())?;
+        fs::write(&config_path, r#"# Niri Session Manager Configuration
+
+# Flatpak applications
+[app_mappings]
+"vesktop" = ["flatpak", "run", "dev.vencord.Vesktop"]
+"discord" = ["flatpak", "run", "com.discordapp.Discord"]
+"slack" = ["flatpak", "run", "com.slack.Slack"]
+"obs" = ["flatpak", "run", "com.obsproject.Studio"]
+
+# Simple command remapping
+"com.mitchellh.ghostty" = ["ghostty"]
+"org.wezfurlong.wezterm" = ["wezterm"]
+
+# Commands with arguments
+"firefox-custom" = ["firefox", "--profile", "default-release"]
+"#)?;
+        return Ok(AppConfig::default());
+    }
+
+    let config_str = fs::read_to_string(&config_path)
+        .context("Failed to read config file")?;
+    
+    let config: AppConfig = toml::from_str(&config_str)
+        .context("Failed to parse config file")?;
+
+    Ok(config)
+}
+
+/// Update restore_session_internal to use app mappings
 async fn restore_session_internal(file_path: &PathBuf, config: &Config) -> Result<()> {
     if !file_path.exists() {
-        println!("No previous session found at {}", file_path.display());
-        println!("Building new session file");
+        log(&format!("No previous session found at {}", file_path.display()));
+        log("Building new session file");
         save_session(&file_path).await?;
         return Ok(());
     }
 
     let session_data = fs::read_to_string(file_path).context("Failed to read session file")?;
     if session_data.trim().is_empty() {
-        println!("Session file at {} is empty", file_path.display());
+        log(&format!("Session file at {} is empty", file_path.display()));
         return Ok(());
     }
     let windows: Vec<Window> =
@@ -108,6 +164,9 @@ async fn restore_session_internal(file_path: &PathBuf, config: &Config) -> Resul
     let current_windows = get_niri_windows().await?;
     let mut handles = Vec::new();
 
+    // Load app configuration
+    let app_config = load_app_config()?;
+    
     for window in windows {
         if let Some(app_id) = &window.app_id {
             if current_windows
@@ -121,18 +180,24 @@ async fn restore_session_internal(file_path: &PathBuf, config: &Config) -> Resul
         let app_id = window.app_id.clone().unwrap_or_default();
         let workspace_id = window.workspace_id;
 
+        // Get command from app mappings or use app_id as fallback
+        let command = app_config.app_mappings
+            .get(&app_id)
+            .cloned()
+            .unwrap_or_else(|| vec![app_id.clone()]);
+
         let spawn_timeout = config.spawn_timeout;
         let handle = spawn(async move {
             let spawn_socket = Socket::connect().context("Failed to connect to Niri IPC socket")?;
             let (reply, _) = spawn_socket
                 .send(Request::Action(Action::Spawn {
-                    command: vec![app_id.clone()],
+                    command: command.clone(),
                 }))
                 .context("Failed to send spawn request")?;
 
             if let Reply::Ok(Response::Handled) = reply {
                 // Use configured spawn timeout
-                for _ in 0..spawn_timeout * 2 { // multiply by 2 since we sleep 500ms each time
+                for _ in 0..spawn_timeout * 2 {
                     sleep(Duration::from_millis(500)).await;
                     let new_windows = get_niri_windows().await?;
                     if let Some(new_window) = new_windows
@@ -153,7 +218,8 @@ async fn restore_session_internal(file_path: &PathBuf, config: &Config) -> Resul
                     }
                 }
             } else {
-                println!("Failed to spawn app: {}", app_id);
+                log(&format!("Failed to spawn app: {} using command: {:?}", 
+                    app_id, command));
             }
 
             Result::<()>::Ok(())
@@ -167,7 +233,7 @@ async fn restore_session_internal(file_path: &PathBuf, config: &Config) -> Resul
         handle.await.context("Task execution failed")??;
     }
 
-    println!("Session restored.");
+    log("Session restored.");
     // Clean up the session file after restoring.
     //fs::remove_file(file_path).context("Failed to delete session file")?;
     //println!("Session file cleaned up.");
@@ -180,13 +246,19 @@ async fn handle_shutdown_signals(shutdown_signal: Arc<Notify>) {
     let mut int_signal = signal(SignalKind::interrupt()).expect("Failed to listen for SIGINT");
     let mut quit_signal = signal(SignalKind::quit()).expect("Failed to listen for SIGQUIT");
 
-
-   // println!("shutdown signal received, notifying waiters");  
-
     select! {
-        _ = term_signal.recv() => shutdown_signal.notify_waiters(),
-        _ = int_signal.recv() => shutdown_signal.notify_waiters(),
-        _ = quit_signal.recv() => shutdown_signal.notify_waiters(),
+        _ = term_signal.recv() => {
+            log("Received SIGTERM signal");
+            shutdown_signal.notify_waiters();
+        },
+        _ = int_signal.recv() => {
+            log("Received SIGINT signal");
+            shutdown_signal.notify_waiters();
+        },
+        _ = quit_signal.recv() => {
+            log("Received SIGQUIT signal");
+            shutdown_signal.notify_waiters();
+        },
     }
 }
 
@@ -199,23 +271,25 @@ async fn periodic_save_session(
     let interval = Duration::from_secs(config.save_interval * 60); // Convert minutes to seconds
     let session_dir = file_path.parent().unwrap_or(&file_path).to_path_buf();
 
+    log(&format!("Starting periodic save task (interval: {} minutes)", config.save_interval));
+
     loop {
         select! {
             _ = sleep(interval) => {
                 if let Err(e) = save_session_with_backup(&file_path, &config).await {
-                    eprintln!("Error saving session: {}", e);
+                    log_error(&format!("Error saving session: {}", e));
                 }
                 // Cleanup old backups after each save
                 if let Err(e) = cleanup_old_backups(&session_dir, config.max_backup_count) {
-                    eprintln!("Error cleaning up old backups: {}", e);
+                    log_error(&format!("Error cleaning up old backups: {}", e));
                 }
             },
             _ = shutdown_signal.notified() => {
-                println!("Shutting down, stopping periodic session saves.");
+                log("Shutting down, stopping periodic session saves");
                 if let Err(e) = save_session_with_backup(&file_path, &config).await {
-                    eprintln!("Error saving session: {}", e);
+                    log_error(&format!("Error saving session: {}", e));
                 } else {
-                    println!("Session saved.");
+                    log("Final session saved");
                 }
                 break;
             }
@@ -246,7 +320,7 @@ fn create_backup(file_path: &PathBuf) -> Result<()> {
         let mut backup_path = file_path.clone();
         backup_path.set_file_name(backup_file_name);
         fs::copy(file_path, &backup_path).context("Failed to create backup file")?;
-        println!("Backup created at {}", backup_path.display());
+        log(&format!("Backup created at {}", backup_path.display()));
     }
     Ok(())
 }
@@ -284,9 +358,10 @@ fn cleanup_old_backups(session_dir: &PathBuf, keep_count: usize) -> Result<()> {
     // Remove older backups
     for backup in backups.iter().skip(keep_count) {
         if let Err(e) = fs::remove_file(backup.path()) {
-            eprintln!("Failed to remove old backup {}: {}", backup.path().display(), e);
+            log_error(&format!("Failed to remove old backup {}: {}", 
+                backup.path().display(), e));
         } else {
-            println!("Removed old backup: {}", backup.path().display());
+            log(&format!("Removed old backup: {}", backup.path().display()));
         }
     }
 
@@ -318,29 +393,53 @@ struct Config {
     retry_delay: u64,
 }
 
+// Update log function to handle format strings
+fn log(message: &str) {
+    println!("{message}");
+    std::io::stdout().flush().unwrap_or_default();
+}
+
+// Update error logging
+fn log_error(message: &str) {
+    eprintln!("{}", message);
+    std::io::stderr().flush().unwrap_or_default();
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Parse command line arguments
     let config = Config::parse();
     
+    log("Starting niri-session-manager");
     let session_file_path = get_session_file_path()?;
     let shutdown_signal = Arc::new(Notify::new());
 
     // Start the periodic save task with config
     let shutdown_signal_clone = Arc::clone(&shutdown_signal);
-    spawn(periodic_save_session(
+    let save_task = spawn(periodic_save_session(
         session_file_path.clone(),
         shutdown_signal_clone,
         config.clone()
     ));
 
     // Restore session with config
+    log("Restoring previous session");
     restore_session(&session_file_path, &config).await?;
     
     let shutdown_signal_clone = Arc::clone(&shutdown_signal);
-    handle_shutdown_signals(shutdown_signal_clone).await;
+    let signal_task = spawn(handle_shutdown_signals(shutdown_signal_clone));
 
-    // Wait for shutdown signal
+    // Wait for shutdown signal and tasks to complete
     shutdown_signal.notified().await;
+    
+    // Wait for tasks to finish with timeout
+    let timeout = Duration::from_secs(5);
+    select! {
+        _ = save_task => log("Save task completed"),
+        _ = signal_task => log("Signal handler completed"),
+        _ = sleep(timeout) => log("Shutdown timed out"),
+    }
+
+    log("Shutdown complete");
     Ok(())
 }
