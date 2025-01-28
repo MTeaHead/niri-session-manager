@@ -110,6 +110,11 @@
           build-attrs = {
             inherit src;
             buildInputs = build-deps;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              # Allow building with a substituted lock file
+              allowBuiltinFetchGit = true;
+            };
           };
 
           deps-only = craneLib.buildDepsOnly ({ } // build-attrs);
