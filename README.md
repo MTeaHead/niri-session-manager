@@ -64,7 +64,7 @@ If no configuration file exists, one will be created with example mappings.
   description = "Your NixOS configuration";
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    niri-session-manager.url = "github:nyawox/niri-session-manager";
+    niri-session-manager.url = "github:MTeaHead/niri-session-manager";
   };
   outputs = { self, nixpkgs, niri-session-manager, ... }: {
     nixosConfigurations = {
