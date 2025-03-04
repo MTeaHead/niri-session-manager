@@ -39,11 +39,21 @@ Example configuration:
 ```toml
 # Niri Session Manager Configuration
 
+# Apps that should only have one instance
+[single_instance_apps] 
+apps = [
+    "firefox",
+    "zen"
+]
+
+#Application remapping
 [app_mappings]
-# Flatpak applications
+
+# flatpak remapping
 "vesktop" = ["flatpak", "run", "dev.vencord.Vesktop"]
 "discord" = ["flatpak", "run", "com.discordapp.Discord"]
 "slack" = ["flatpak", "run", "com.slack.Slack"]
+"obs" = ["flatpak", "run", "com.obsproject.Studio"]
 
 # Simple command remapping
 "com.mitchellh.ghostty" = ["ghostty"]
@@ -100,3 +110,6 @@ Session data and backups are stored in:
 
 ## TODO
 - Use PID to fetch the actual process command
+
+## Future (when IPC supports it)
+- Grab window size and further details for better placement when restoring windows

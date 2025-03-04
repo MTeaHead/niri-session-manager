@@ -1,3 +1,5 @@
+cargo-features = ["edition2024"]
+
 [package]
 name = "niri-session-manager"
 version = "0.1.1"

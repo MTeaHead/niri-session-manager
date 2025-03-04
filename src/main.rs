@@ -96,12 +96,21 @@ async fn restore_session(file_path: &PathBuf, config: &Config) -> Result<()> {
 struct AppConfig {
     #[serde(default)]
     app_mappings: HashMap<String, Vec<String>>,
+    #[serde(default, rename = "single_instance_apps")]
+    single_instance: SingleInstanceAppsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct SingleInstanceAppsConfig {
+    #[serde(default)]
+    apps: Vec<String>,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             app_mappings: HashMap::new(),
+            single_instance: SingleInstanceAppsConfig::default(),
         }
     }
 }
@@ -118,8 +127,17 @@ fn load_app_config() -> Result<AppConfig> {
         fs::create_dir_all(config_path.parent().unwrap())?;
         fs::write(&config_path, r#"# Niri Session Manager Configuration
 
-# Flatpak applications
+# Apps that should only have one instance
+[single_instance_apps] 
+apps = [
+    "firefox",
+    "zen"
+]
+
+#Application remapping
 [app_mappings]
+
+# flatpak remapping
 "vesktop" = ["flatpak", "run", "dev.vencord.Vesktop"]
 "discord" = ["flatpak", "run", "com.discordapp.Discord"]
 "slack" = ["flatpak", "run", "com.slack.Slack"]
@@ -140,7 +158,9 @@ fn load_app_config() -> Result<AppConfig> {
     
     let config: AppConfig = toml::from_str(&config_str)
         .context("Failed to parse config file")?;
-
+    //log(&format!("Single-instance apps: {:?}", config.single_instance.apps));
+    //log(&format!("Loaded configuration with {} app mappings", config.app_mappings.len()));
+    //log(&format!("{:?} app mappings", config.app_mappings));
     Ok(config)
 }
 
@@ -166,19 +186,27 @@ async fn restore_session_internal(file_path: &PathBuf, config: &Config) -> Resul
 
     // Load app configuration
     let app_config = load_app_config()?;
+
+    let mut spawned_apps = std::collections::HashSet::new();
     
     for window in windows {
-        if let Some(app_id) = &window.app_id {
-            if current_windows
-                .iter()
-                .any(|w| w.app_id == Some(app_id.clone()))
-            {
-                continue;
-            }
-        }
 
         let app_id = window.app_id.clone().unwrap_or_default();
+
+        let should_skip = current_windows.iter().any(|w| w.app_id == Some(app_id.clone()))
+            || spawned_apps.contains(&app_id);
+        
         let workspace_id = window.workspace_id;
+
+        // Check if app is single-instance and already running
+        if app_config.single_instance.apps.contains(&app_id) && should_skip {
+            log(&format!("Skipping single-instance app: {}", app_id));
+            continue;
+        }
+
+        if app_config.single_instance.apps.contains(&app_id) {
+            spawned_apps.insert(app_id.clone());
+        }
 
         // Get command from app mappings or use app_id as fallback
         let command = app_config.app_mappings
