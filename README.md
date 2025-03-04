@@ -1,7 +1,5 @@
 # Niri Session Manager
 
-[![GitHub Actions](https://img.shields.io/endpoint.svg?url=https%3A%2F%2Factions-badge.atrox.dev%2Fnyawox%2Fniri-session-manager%2Fbadge%3Fref%3Dmain&style=for-the-badge&labelColor=11111b)](https://actions-badge.atrox.dev/nyawox/niri-session-manager/goto?ref=main)
-
 A session manager for the Niri Wayland compositor that automatically saves and restores your window layout.
 
 ## Features
