@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use niri_ipc::{Action, Reply, Request, Response, Window, WorkspaceReferenceArg, socket::Socket};
+use niri_ipc::{Action, Reply, Request, Response, Window, Workspace, WorkspaceReferenceArg, socket::Socket};
 use std::{fs, path::PathBuf, sync::Arc};
 use chrono::{Local, SecondsFormat};
 use tokio::{
@@ -19,13 +19,26 @@ use toml;
 
 /// Fetch the windows list
 async fn get_niri_windows() -> Result<Vec<Window>> {
-    let socket = Socket::connect().context("Failed to connect to Niri IPC socket")?;
-    let (reply, _) = socket
+    let mut socket = Socket::connect().context("Failed to connect to Niri IPC socket")?;
+    let reply = socket
         .send(Request::Windows)
         .context("Failed to retrieve windows from Niri IPC")?;
 
     match reply {
         Reply::Ok(Response::Windows(windows)) => Ok(windows),
+        Reply::Err(error_msg) => anyhow::bail!("Niri IPC returned an error: {}", error_msg),
+        _ => anyhow::bail!("Unexpected reply type from Niri"),
+    }
+}
+
+async fn get_niri_workspaces() -> Result<Vec<Workspace>> {
+    let mut socket = Socket::connect().context("Failed to connect to Niri IPC socket")?;
+    let reply = socket
+        .send(Request::Workspaces)
+        .context("Failed to retrieve workspaces from Niri IPC")?;
+
+    match reply {
+        Reply::Ok(Response::Workspaces(workspaces)) => Ok(workspaces),
         Reply::Err(error_msg) => anyhow::bail!("Niri IPC returned an error: {}", error_msg),
         _ => anyhow::bail!("Unexpected reply type from Niri"),
     }
@@ -40,25 +53,37 @@ fn get_session_file_path() -> Result<PathBuf> {
     Ok(session_dir.join("session.json"))
 }
 
-// Define a struct that doesn't include the `title` field
-#[derive(Serialize, Deserialize)]
+/// Define a struct that doesn't include the `title` field
+#[derive(Serialize, Deserialize, Debug)]
 struct WindowWithoutTitle {
     id: u64,
     app_id: String,
-    workspace_id: Option<u64>,
+    /// Index of the workspace on the corresponding monitor
+    workspace_idx: Option<u8>, 
+    /// Name of the workspace, in case of a named workspace
+    workspace_name: Option<String>,
+    /// Output the workspace is on
+    workspace_output: Option<String>,
     is_focused: bool,
 }
 
 /// Save the session to a file
 async fn save_session(file_path: &PathBuf) -> Result<()> {
     let windows = get_niri_windows().await?;
+    let workspaces = get_niri_workspaces().await?;
 
     // Create a new list of windows without the `title` field
     let windows_without_title: Vec<WindowWithoutTitle> = windows.into_iter().map(|window| {
+
+        // Find the workspace for the window
+        let workspace = workspaces.iter().find(|w| window.workspace_id == Some(w.id));
+
         WindowWithoutTitle {
             id: window.id,
+            workspace_idx: workspace.map(|w| w.idx),
+            workspace_name: workspace.and_then(|w| w.name.clone()),
+            workspace_output: workspace.and_then(|w| w.output.clone()),
             app_id: window.app_id.unwrap_or_default(),
-            workspace_id: window.workspace_id,
             is_focused: window.is_focused,
         }
     }).collect();
@@ -187,7 +212,7 @@ async fn restore_session_internal(file_path: &PathBuf, config: &Config) -> Resul
         log(&format!("Session file at {} is empty", file_path.display()));
         return Ok(());
     }
-    let windows: Vec<Window> =
+    let windows: Vec<WindowWithoutTitle> =
         serde_json::from_str(&session_data).context("Failed to parse session JSON")?;
 
     let current_windows = get_niri_windows().await?;
@@ -199,8 +224,7 @@ async fn restore_session_internal(file_path: &PathBuf, config: &Config) -> Resul
     let mut spawned_apps = std::collections::HashSet::new();
     
     for window in windows {
-
-        let app_id = window.app_id.clone().unwrap_or_default();
+        let app_id = window.app_id.clone();
 
             // Check if the app should be skipped
         if app_config.skip_apps.apps.contains(&app_id) {
@@ -210,8 +234,6 @@ async fn restore_session_internal(file_path: &PathBuf, config: &Config) -> Resul
 
         let should_skip = current_windows.iter().any(|w| w.app_id == Some(app_id.clone()))
             || spawned_apps.contains(&app_id);
-        
-        let workspace_id = window.workspace_id;
 
         // Check if app is single-instance and already running
         if app_config.single_instance.apps.contains(&app_id) && should_skip {
@@ -231,14 +253,26 @@ async fn restore_session_internal(file_path: &PathBuf, config: &Config) -> Resul
 
         let spawn_timeout = config.spawn_timeout;
         let handle = spawn(async move {
-            let spawn_socket = Socket::connect().context("Failed to connect to Niri IPC socket")?;
-            let (reply, _) = spawn_socket
+            let mut spawn_socket = Socket::connect().context("Failed to connect to Niri IPC socket")?;
+            let reply = spawn_socket
                 .send(Request::Action(Action::Spawn {
                     command: command.clone(),
                 }))
                 .context("Failed to send spawn request")?;
 
             if let Reply::Ok(Response::Handled) = reply {
+
+                let workspace_idx = window.workspace_idx;
+                let workspace_name = window.workspace_name;
+                let workspace_output = window.workspace_output;
+
+                // Prefer workspace name of named workspaces over workspace index
+                let workspace_reference = if workspace_name.is_some() {
+                    WorkspaceReferenceArg::Name(workspace_name.unwrap_or_default())
+                } else {
+                    WorkspaceReferenceArg::Index(workspace_idx.unwrap_or_default())
+                };
+
                 // Use configured spawn timeout
                 for _ in 0..spawn_timeout * 2 {
                     sleep(Duration::from_millis(500)).await;
@@ -247,14 +281,31 @@ async fn restore_session_internal(file_path: &PathBuf, config: &Config) -> Resul
                         .iter()
                         .find(|w| w.app_id == Some(app_id.clone()))
                     {
-                        let move_socket =
+                        let mut move_socket =
                             Socket::connect().context("Failed to connect to Niri IPC socket")?;
+
+                        // Move window to the correct monitor
+                        // 
+                        // TODO: What will happen if the monitor with the given name does not
+                        // exist? In a test, niri handled this correctly by falling back to
+                        // existing monitors.
+                        let _ = move_socket.send(Request::Action(Action::MoveWindowToMonitor {
+                            id: Some(new_window.id),
+                            output: workspace_output.unwrap_or_default(),
+                        }));
+
+                        // Move window to the correct workspace
+                        //
+                        // TODO: What will happen if the workspace with the given index or name
+                        // does not exist? Due to niri only creating new workspaces if necessary, a
+                        // window for workspaces x+1 might fail to be moved, because no window was
+                        // yet moved to workspace x. Possible solution might be to create windows in order of
+                        // workspace index?
                         let _ = move_socket
                             .send(Request::Action(Action::MoveWindowToWorkspace {
                                 window_id: Some(new_window.id),
-                                reference: WorkspaceReferenceArg::Id(
-                                    workspace_id.unwrap_or_default(),
-                                ),
+                                focus: false,
+                                reference: workspace_reference
                             }))
                             .context("Failed to move window to the workspace")?;
                         break;
