@@ -1,4 +1,4 @@
-{ buildRustPackage }:
+{ buildRustPackage, lib }:
 buildRustPackage (
   finalAttrs:
   let
@@ -6,7 +6,18 @@ buildRustPackage (
   in
   {
     pname = "niri-session-manager";
-    src = ./.;
+    src = lib.sources.cleanSourceWith {
+      src = ./.;
+      filter =
+        path: type:
+        type == "directory"
+        || lib.any (ext: lib.hasSuffix ext (baseNameOf path)) [
+          ".rs"
+          ".toml"
+          ".lock"
+          ".nix"
+        ];
+    };
     inherit (cargoToml.package) version;
 
     cargoLock = {

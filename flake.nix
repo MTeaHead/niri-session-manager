@@ -60,8 +60,8 @@
         default = import ./shell.nix { inherit pkgs; };
       });
 
-      overlays.niri-session-manager = self: super: {
-          inherit (self.packages.${getPlatform super}) niri-session-manager;
-        };
+      overlays.niri-session-manager = final: prev: {
+        inherit (self.packages.${prev.hostPlatform.system}) niri-session-manager;
+      };
     };
 }

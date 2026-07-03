@@ -9,6 +9,7 @@ A session manager for the Niri Wayland compositor that automatically saves and r
 - Graceful handling of window spawn failures
 - Configurable retry logic for session restoration
 - Custom app launch command mapping via TOML configuration
+- **Terminal state recovery** — restores running commands inside terminals (e.g. `btop`, `nvim`, `ssh`)
 
 ## Usage
 
@@ -66,9 +67,36 @@ apps = [
 
 # Commands with arguments
 "firefox-custom" = ["firefox", "--profile", "default-release"]
+
+# Terminal state recovery — restore running commands inside terminals
+[terminal_state]
+enabled = true
+terminal_app_ids = ["kitty", "foot", "org.wezfurlong.wezterm", "com.mitchellh.ghostty", "alacritty"]
+shell_names = ["fish", "bash", "zsh", "sh", "dash", "-fish", "-bash", "-zsh", "-sh", "sudo", "doas"]
+helper_names = ["kitten"]
+max_walk_depth = 20
 ```
 
 If no configuration file exists, one will be created with example mappings.
+
+### Terminal State Recovery
+
+When enabled, the session manager walks the process tree of terminal windows via `/proc` to find foreground child processes (skipping shells like `fish`, `bash`, `zsh`). On restore, it re-launches the terminal with the original command and working directory.
+
+For example, if `kitty` was running `btop` in `/home/user/projects`, the restored command becomes:
+
+```bash
+kitty --directory /home/user/projects sh -c "'btop'; exec $SHELL"
+```
+
+Terminal-specific flags are handled automatically:
+- **kitty**: `--directory`, positional command
+- **foot**: `--working-directory`, positional command
+- **wezterm**: `start --cwd ... -- sh -c ...`
+- **ghostty**: `--working-directory=...`, `-e sh -c ...`
+- **alacritty**: `--working-directory`, `-e sh -c ...`
+
+This feature is Linux-only. On other platforms, `terminal_state` is always `None`.
 
 ## Installation
 
@@ -113,8 +141,7 @@ Session data and backups are stored in:
 - Backups: `$XDG_DATA_HOME/niri-session-manager/session-{timestamp}.bak`
 - Configuration: `$XDG_CONFIG_HOME/niri-session-manager/config.toml`
 
-## TODO
-- Use PID to fetch the actual process command
-
 ## Future (when IPC supports it)
 - Grab window size and further details for better placement when restoring windows
+- Configurable per-terminal restore command templates
+- `--dry-run` flag to preview restore without spawning
