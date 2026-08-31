@@ -31,7 +31,7 @@
           }
         )
       );
-      getPlatform = p: p.hostPlatform.system;
+      getPlatform = p: p.stdenv.hostPlatform.system;
     in
     {
       formatter = forAllSystems (pkgs: treefmtEval.${getPlatform pkgs}.config.build.wrapper);
